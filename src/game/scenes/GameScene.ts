@@ -20,6 +20,7 @@ import { advanceAlongPath } from "../../domain/navigation/pathFollower";
 import type { SearchAlgorithm, SearchResult, SearchStatus } from "../../domain/navigation/search";
 import { timeSinceLastPerception } from "../../domain/perception/memory";
 import type { VisionReason, VisionResult } from "../../domain/perception/perception";
+import { computeVisionCone } from "../../domain/perception/visionCone";
 
 const PLAYER_SPEED = 190;
 const GUARD_SPEED = 115;
@@ -40,6 +41,14 @@ const VISION_LABELS: Readonly<Record<VisionReason, string>> = {
   occluded: "OCLUIDO",
   "invalid-facing": "DIRECCION INVALIDA",
 };
+const VISION_FILL_COLORS: Readonly<Record<VisionReason, number>> = {
+  visible: 0x73c991,
+  "out-of-range": 0x6b8afd,
+  "outside-cone": 0x8e7cc3,
+  occluded: 0xe0a458,
+  "invalid-facing": 0xe16969,
+};
+const VISION_FLASH_DURATION_MS = 350;
 
 export class GameScene extends Phaser.Scene {
   private player!: Phaser.GameObjects.Rectangle;
@@ -65,6 +74,8 @@ export class GameScene extends Phaser.Scene {
   private guardWaypoints: readonly Vector2[] = [];
   private nextWaypoint = 0;
   private perceptionState: PerceptionSimulationState = initialPerceptionState();
+  private lastVisionVisible: boolean | null = null;
+  private visionFlashUntilMs = 0;
 
   public constructor() {
     super("GameScene");
@@ -77,6 +88,8 @@ export class GameScene extends Phaser.Scene {
     this.guardWaypoints = [];
     this.nextWaypoint = 0;
     this.perceptionState = initialPerceptionState();
+    this.lastVisionVisible = null;
+    this.visionFlashUntilMs = 0;
     this.cameras.main.setBackgroundColor("#10161c");
     this.drawGrid();
 
@@ -295,26 +308,51 @@ export class GameScene extends Phaser.Scene {
     });
     this.perceptionState = frame.state;
 
-    this.drawPerception(frame.vision);
+    if (this.lastVisionVisible !== null && this.lastVisionVisible !== frame.vision.visible) {
+      this.visionFlashUntilMs = time + VISION_FLASH_DURATION_MS;
+    }
+    this.lastVisionVisible = frame.vision.visible;
+
+    this.drawPerception(frame.vision, time);
     this.updateTelemetry(time, frame.vision, frame.soundHeard);
   }
 
-  private drawPerception(vision: VisionResult): void {
+  private drawPerception(vision: VisionResult, time: number): void {
     this.perceptionGraphics.clear();
-    const facingAngle = Math.atan2(this.guardFacing.y, this.guardFacing.x);
-    const halfFieldOfView = FIELD_OF_VIEW / 2;
-    this.perceptionGraphics.fillStyle(vision.visible ? 0x73c991 : 0x6b8afd, 0.16);
-    this.perceptionGraphics.beginPath();
-    this.perceptionGraphics.moveTo(this.guard.x, this.guard.y);
-    this.perceptionGraphics.arc(
-      this.guard.x,
-      this.guard.y,
-      VISION_RANGE,
-      facingAngle - halfFieldOfView,
-      facingAngle + halfFieldOfView,
-    );
-    this.perceptionGraphics.closePath();
-    this.perceptionGraphics.fillPath();
+    const cone = computeVisionCone({
+      map: LAB_MAP,
+      tileSize: TILE_SIZE,
+      observer: { x: this.guard.x, y: this.guard.y },
+      facing: this.guardFacing,
+      range: VISION_RANGE,
+      fieldOfViewRadians: FIELD_OF_VIEW,
+    });
+
+    const fillColor = VISION_FILL_COLORS[vision.reason];
+    const origin = cone[0];
+    if (origin && cone.length > 1) {
+      this.perceptionGraphics.fillStyle(fillColor, 0.16);
+      this.perceptionGraphics.beginPath();
+      this.perceptionGraphics.moveTo(origin.x, origin.y);
+      for (const vertex of cone.slice(1)) {
+        this.perceptionGraphics.lineTo(vertex.x, vertex.y);
+      }
+      this.perceptionGraphics.closePath();
+      this.perceptionGraphics.fillPath();
+    }
+
+    const flashRemaining = this.visionFlashUntilMs - time;
+    if (flashRemaining > 0 && origin && cone.length > 1) {
+      const strength = flashRemaining / VISION_FLASH_DURATION_MS;
+      this.perceptionGraphics.lineStyle(3, 0xffffff, 0.85 * strength);
+      this.perceptionGraphics.beginPath();
+      this.perceptionGraphics.moveTo(origin.x, origin.y);
+      for (const vertex of cone.slice(1)) {
+        this.perceptionGraphics.lineTo(vertex.x, vertex.y);
+      }
+      this.perceptionGraphics.closePath();
+      this.perceptionGraphics.strokePath();
+    }
 
     if (this.perceptionState.soundEvent) {
       this.perceptionGraphics.lineStyle(2, 0xe5b454, 0.8);
