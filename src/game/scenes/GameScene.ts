@@ -49,6 +49,16 @@ const VISION_FILL_COLORS: Readonly<Record<VisionReason, number>> = {
   "invalid-facing": 0xe16969,
 };
 const VISION_FLASH_DURATION_MS = 350;
+const GUARD_BASE_SCALE = 1;
+const SURPRISE_SCALE_AMPLITUDE = 0.6;
+const SURPRISE_DURATION_MS = 1500;
+const ALERT_PULSE_AMPLITUDE = 0.12;
+const ALERT_PULSE_PERIOD_MS = 300;
+const GUARD_BASE_COLOR = 0x6b8afd;
+const GUARD_ALERT_COLOR = 0xe5b454;
+const GUARD_SEARCH_COLOR = 0xe16969;
+
+type GuardVisualState = "idle" | "surprised" | "alert" | "searching";
 
 export class GameScene extends Phaser.Scene {
   private player!: Phaser.GameObjects.Rectangle;
@@ -76,6 +86,8 @@ export class GameScene extends Phaser.Scene {
   private perceptionState: PerceptionSimulationState = initialPerceptionState();
   private lastVisionVisible: boolean | null = null;
   private visionFlashUntilMs = 0;
+  private surpriseStartedAtMs: number | null = null;
+  private guardVisualState: GuardVisualState = "idle";
 
   public constructor() {
     super("GameScene");
@@ -90,6 +102,8 @@ export class GameScene extends Phaser.Scene {
     this.perceptionState = initialPerceptionState();
     this.lastVisionVisible = null;
     this.visionFlashUntilMs = 0;
+    this.surpriseStartedAtMs = null;
+    this.guardVisualState = "idle";
     this.cameras.main.setBackgroundColor("#10161c");
     this.drawGrid();
 
@@ -132,7 +146,7 @@ export class GameScene extends Phaser.Scene {
     this.navigationGraphics = this.add.graphics().setDepth(2);
     const guardPosition = cellCenter(GUARD_START, TILE_SIZE);
     this.guard = this.add
-      .circle(guardPosition.x, guardPosition.y, 11, 0x6b8afd)
+      .circle(guardPosition.x, guardPosition.y, 11, GUARD_BASE_COLOR)
       .setStrokeStyle(2, 0xb9c5ff)
       .setDepth(4);
     this.targetMarker = this.add
@@ -293,6 +307,39 @@ export class GameScene extends Phaser.Scene {
     }
   }
 
+  private updateGuardAnimation(time: number, soundHeard: boolean, visionVisible: boolean): void {
+    let scale = GUARD_BASE_SCALE;
+    let color = GUARD_BASE_COLOR;
+    let state: GuardVisualState = "idle";
+
+    const surpriseElapsed = this.surpriseStartedAtMs === null
+      ? null
+      : time - this.surpriseStartedAtMs;
+    const surpriseActive = surpriseElapsed !== null
+      && surpriseElapsed >= 0
+      && surpriseElapsed < SURPRISE_DURATION_MS;
+
+    if (visionVisible && surpriseActive && surpriseElapsed !== null) {
+      state = "surprised";
+      const progress = surpriseElapsed / SURPRISE_DURATION_MS;
+      scale = GUARD_BASE_SCALE + SURPRISE_SCALE_AMPLITUDE * Math.sin(Math.PI * progress);
+    } else if (!visionVisible && soundHeard) {
+      state = "alert";
+      color = GUARD_ALERT_COLOR;
+      const pulse = 0.5 + 0.5 * Math.sin((time / ALERT_PULSE_PERIOD_MS) * Math.PI * 2);
+      scale = GUARD_BASE_SCALE + ALERT_PULSE_AMPLITUDE * pulse;
+    } else if (!visionVisible && this.perceptionState.memory.lastKnownPosition !== null) {
+      state = "searching";
+      color = GUARD_SEARCH_COLOR;
+    }
+
+    this.guard.setScale(scale);
+    if (this.guardVisualState !== state) {
+      this.guard.setFillStyle(color);
+      this.guardVisualState = state;
+    }
+  }
+
   private updatePerception(time: number): void {
     const observer = { x: this.guard.x, y: this.guard.y };
     const target = { x: this.player.x, y: this.player.y };
@@ -308,11 +355,18 @@ export class GameScene extends Phaser.Scene {
     });
     this.perceptionState = frame.state;
 
-    if (this.lastVisionVisible !== null && this.lastVisionVisible !== frame.vision.visible) {
+    const visionVisible = frame.vision.visible;
+    if (this.lastVisionVisible !== null && this.lastVisionVisible !== visionVisible) {
       this.visionFlashUntilMs = time + VISION_FLASH_DURATION_MS;
     }
-    this.lastVisionVisible = frame.vision.visible;
+    if (!visionVisible) {
+      this.surpriseStartedAtMs = null;
+    } else if (this.lastVisionVisible === false) {
+      this.surpriseStartedAtMs = time;
+    }
+    this.lastVisionVisible = visionVisible;
 
+    this.updateGuardAnimation(time, frame.soundHeard, visionVisible);
     this.drawPerception(frame.vision, time);
     this.updateTelemetry(time, frame.vision, frame.soundHeard);
   }
