@@ -17,7 +17,7 @@ import {
 import { cellCenter, isWalkable, worldToCell, type GridPoint } from "../../domain/model/grid";
 import type { Vector2 } from "../../domain/model/vector";
 import { advanceAlongPath } from "../../domain/navigation/pathFollower";
-import type { SearchAlgorithm, SearchResult, SearchStatus } from "../../domain/navigation/search";
+import type { SearchResult, SearchStatus } from "../../domain/navigation/search";
 import { timeSinceLastPerception } from "../../domain/perception/memory";
 import type { VisionReason, VisionResult } from "../../domain/perception/perception";
 import { computeVisionCone } from "../../domain/perception/visionCone";
@@ -57,8 +57,26 @@ const ALERT_PULSE_PERIOD_MS = 300;
 const GUARD_BASE_COLOR = 0x6b8afd;
 const GUARD_ALERT_COLOR = 0xe5b454;
 const GUARD_SEARCH_COLOR = 0xe16969;
+const PATROL_PAUSE_DURATION_MS = 1400;
+const PATROL_LOOK_DURATION_MS = 700;
+const PATROL_SEED = 0x9e3779b9;
+const CARDINAL_DIRECTIONS: readonly Vector2[] = [
+  { x: 0, y: -1 },
+  { x: 1, y: 0 },
+  { x: 0, y: 1 },
+  { x: -1, y: 0 },
+];
+const PATROL_POINTS: readonly GridPoint[] = [
+  { x: 2, y: 2 },
+  { x: 27, y: 2 },
+  { x: 27, y: 17 },
+  { x: 2, y: 17 },
+  { x: 13, y: 7 },
+  { x: 13, y: 13 },
+];
 
 type GuardVisualState = "idle" | "surprised" | "alert" | "searching";
+type PatrolPhase = "traveling" | "pausing";
 
 export class GameScene extends Phaser.Scene {
   private player!: Phaser.GameObjects.Rectangle;
@@ -70,19 +88,23 @@ export class GameScene extends Phaser.Scene {
   private moveLeft!: Phaser.Input.Keyboard.Key;
   private moveRight!: Phaser.Input.Keyboard.Key;
   private reset!: Phaser.Input.Keyboard.Key;
-  private toggleAlgorithm!: Phaser.Input.Keyboard.Key;
   private emitSound!: Phaser.Input.Keyboard.Key;
   private navigationGraphics!: Phaser.GameObjects.Graphics;
   private perceptionGraphics!: Phaser.GameObjects.Graphics;
   private targetMarker!: Phaser.GameObjects.Arc;
   private lastKnownMarker!: Phaser.GameObjects.Arc;
   private navigationHud!: Phaser.GameObjects.Text;
-  private navigationAlgorithm: SearchAlgorithm = "astar";
   private navigationGoal: GridPoint = GUARD_START;
   private navigationSummary: readonly string[] = [];
   private guardFacing: Vector2 = { x: -1, y: 0 };
   private guardWaypoints: readonly Vector2[] = [];
   private nextWaypoint = 0;
+  private patrolPhase: PatrolPhase = "traveling";
+  private patrolTargetIndex = 0;
+  private patrolPauseStartedAtMs = 0;
+  private patrolPauseUntilMs = 0;
+  private patrolLookDirections: readonly Vector2[] = [];
+  private randomState = PATROL_SEED;
   private perceptionState: PerceptionSimulationState = initialPerceptionState();
   private lastVisionVisible: boolean | null = null;
   private visionFlashUntilMs = 0;
@@ -94,8 +116,16 @@ export class GameScene extends Phaser.Scene {
   }
 
   public create(): void {
-    this.navigationAlgorithm = "astar";
-    this.navigationGoal = GUARD_START;
+    this.randomState = PATROL_SEED;
+    this.patrolPhase = "traveling";
+    this.patrolPauseStartedAtMs = 0;
+    this.patrolPauseUntilMs = 0;
+    this.patrolLookDirections = [];
+    const startIndex = PATROL_POINTS.findIndex(
+      (point) => point.x === GUARD_START.x && point.y === GUARD_START.y,
+    );
+    this.patrolTargetIndex = this.selectNextPatrolTarget(startIndex);
+    this.navigationGoal = PATROL_POINTS[this.patrolTargetIndex] ?? GUARD_START;
     this.guardFacing = { x: -1, y: 0 };
     this.guardWaypoints = [];
     this.nextWaypoint = 0;
@@ -139,7 +169,6 @@ export class GameScene extends Phaser.Scene {
     this.moveLeft = keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.A);
     this.moveRight = keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.D);
     this.reset = keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.R);
-    this.toggleAlgorithm = keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.SPACE);
     this.emitSound = keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.Q);
 
     this.perceptionGraphics = this.add.graphics().setDepth(1);
@@ -179,7 +208,6 @@ export class GameScene extends Phaser.Scene {
       .setOrigin(1, 0)
       .setDepth(10);
 
-    this.input.on("pointerdown", this.handlePointerDown, this);
     this.renderNavigation();
     this.updatePerception(0);
   }
@@ -188,11 +216,6 @@ export class GameScene extends Phaser.Scene {
     if (Phaser.Input.Keyboard.JustDown(this.reset)) {
       this.scene.restart();
       return;
-    }
-
-    if (Phaser.Input.Keyboard.JustDown(this.toggleAlgorithm)) {
-      this.navigationAlgorithm = this.navigationAlgorithm === "astar" ? "bfs" : "astar";
-      this.renderNavigation();
     }
 
     if (Phaser.Input.Keyboard.JustDown(this.emitSound)) {
@@ -215,7 +238,7 @@ export class GameScene extends Phaser.Scene {
     }
 
     this.playerBody.setVelocity(velocity.x, velocity.y);
-    this.updateGuardMovement(delta);
+    this.updatePatrol(time, delta);
     this.updatePerception(time);
   }
 
@@ -231,19 +254,9 @@ export class GameScene extends Phaser.Scene {
     }
   }
 
-  private handlePointerDown(pointer: Phaser.Input.Pointer): void {
-    this.navigationGoal = worldToCell({ x: pointer.worldX, y: pointer.worldY }, TILE_SIZE);
-    this.renderNavigation();
-  }
-
   private renderNavigation(): void {
     const guardCell = worldToCell({ x: this.guard.x, y: this.guard.y }, TILE_SIZE);
-    const result = calculateRoute(
-      LAB_MAP,
-      guardCell,
-      this.navigationGoal,
-      this.navigationAlgorithm,
-    );
+    const result = calculateRoute(LAB_MAP, guardCell, this.navigationGoal, "astar");
     this.drawSearchResult(result);
     this.guardWaypoints = result.status === "success"
       ? result.path.map((point) => cellCenter(point, TILE_SIZE))
@@ -291,7 +304,12 @@ export class GameScene extends Phaser.Scene {
     this.navigationGraphics.strokePath();
   }
 
-  private updateGuardMovement(delta: number): void {
+  private updatePatrol(time: number, delta: number): void {
+    if (this.patrolPhase === "pausing") {
+      this.updatePatrolLook(time);
+      return;
+    }
+
     const previous = { x: this.guard.x, y: this.guard.y };
     const movement = advanceAlongPath(
       previous,
@@ -305,6 +323,77 @@ export class GameScene extends Phaser.Scene {
     if (movement.direction) {
       this.guardFacing = movement.direction;
     }
+
+    if (movement.completed) {
+      this.beginPatrolPause(time);
+    }
+  }
+
+  private beginPatrolPause(time: number): void {
+    this.patrolPhase = "pausing";
+    this.patrolPauseStartedAtMs = time;
+    this.patrolPauseUntilMs = time + PATROL_PAUSE_DURATION_MS;
+    this.patrolLookDirections = this.pickLookDirections();
+    this.applyLookDirection(0);
+  }
+
+  private updatePatrolLook(time: number): void {
+    const elapsed = time - this.patrolPauseStartedAtMs;
+    const lastIndex = this.patrolLookDirections.length - 1;
+    const lookIndex = lastIndex <= 0
+      ? 0
+      : Math.min(lastIndex, Math.floor(Math.max(0, elapsed) / PATROL_LOOK_DURATION_MS));
+    this.applyLookDirection(lookIndex);
+
+    if (time >= this.patrolPauseUntilMs) {
+      this.finishPatrolPause();
+    }
+  }
+
+  private finishPatrolPause(): void {
+    this.patrolPhase = "traveling";
+    this.patrolTargetIndex = this.selectNextPatrolTarget(this.patrolTargetIndex);
+    this.navigationGoal = PATROL_POINTS[this.patrolTargetIndex] ?? GUARD_START;
+    this.renderNavigation();
+  }
+
+  private applyLookDirection(index: number): void {
+    const direction = this.patrolLookDirections[index];
+    if (direction) {
+      this.guardFacing = direction;
+    }
+  }
+
+  private pickLookDirections(): readonly Vector2[] {
+    const total = CARDINAL_DIRECTIONS.length;
+    const firstIndex = Math.floor(this.nextRandom() * total);
+    const secondOffset = Math.floor(this.nextRandom() * (total - 1));
+    const secondIndex = secondOffset >= firstIndex ? secondOffset + 1 : secondOffset;
+    const first = CARDINAL_DIRECTIONS[firstIndex];
+    const second = CARDINAL_DIRECTIONS[secondIndex];
+    return [first ?? { x: 0, y: -1 }, second ?? { x: 1, y: 0 }];
+  }
+
+  private selectNextPatrolTarget(currentIndex: number): number {
+    const total = PATROL_POINTS.length;
+    if (total <= 1) {
+      return 0;
+    }
+    const validCurrent = currentIndex >= 0 && currentIndex < total;
+    const range = validCurrent ? total - 1 : total;
+    const offset = Math.floor(this.nextRandom() * range);
+    if (!validCurrent) {
+      return offset;
+    }
+    return offset >= currentIndex ? offset + 1 : offset;
+  }
+
+  private nextRandom(): number {
+    this.randomState = (this.randomState + 0x6d2b79f5) >>> 0;
+    let value = this.randomState;
+    value = Math.imul(value ^ (value >>> 15), value | 1);
+    value ^= value + Math.imul(value ^ (value >>> 7), value | 61);
+    return ((value ^ (value >>> 14)) >>> 0) / 4294967296;
   }
 
   private updateGuardAnimation(time: number, soundHeard: boolean, visionVisible: boolean): void {
